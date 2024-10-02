@@ -39,6 +39,35 @@ fn writeString(data: []const u8, writer: anytype) !void {
     _ = try writer.write(data);
 }
 
+fn writeArray(comptime T: type, val: []const T, writer: anytype) !void {
+    if (val.len <= 15) {
+        try writer.writeInt(u8, 0b10010000 | @as(u8, @truncate(val.len)), .big);
+    } else if (val.len <= 65535) {
+        try writer.writeInt(u8, 0xdc, .big);
+        try writer.writeInt(u16, @truncate(val.len), .big);
+    } else {
+        try writer.writeInt(u8, 0xdd, .big);
+        try writer.writeInt(u32, @truncate(val.len), .big);
+    }
+    for (val) |v| {
+        try encode(T, v, writer);
+    }
+}
+
+fn writeBin(val: []const u8, writer: anytype) !void {
+    if (val.len <= 255) {
+        try writer.writeInt(u8, 0xc4, .big);
+        try writer.writeInt(u8, @truncate(val.len), .big);
+    } else if (val.len <= 65535) {
+        try writer.writeInt(u8, 0xc5, .big);
+        try writer.writeInt(u16, @truncate(val.len), .big);
+    } else {
+        try writer.writeInt(u8, 0xc5, .big);
+        try writer.writeInt(u32, @truncate(val.len), .big);
+    }
+    _ = try writer.write(val);
+}
+
 pub fn encode(comptime T: type, val: T, writer: anytype) !void {
     const info = @typeInfo(T);
     switch (info) {
@@ -148,8 +177,20 @@ pub fn encode(comptime T: type, val: T, writer: anytype) !void {
                 try writer.writeFloat(f64, val);
             }
         },
-        .array => {},
-        .pointer => {},
+        .array => |a_info| {
+            if (a_info.child == u8) {
+                try writeBin(val[0..], writer);
+            } else {
+                try writeArray(a_info.child, val[0..], writer);
+            }
+        },
+        .pointer => |p_info| {
+            if (p_info.child == u8) {
+                try writeBin(val[0..], writer);
+            } else {
+                try writeArray(p_info.child, val[0..], writer);
+            }
+        },
         .null => {
             try writer.writeInt(u8, 0xc0);
         },
@@ -164,16 +205,35 @@ pub fn encode(comptime T: type, val: T, writer: anytype) !void {
     //
 }
 
+pub fn decode(reader: anytype) !void {
+    while (true) {
+        const byte = reader.readByte() catch break;
+        if (@as(u1, @truncate(byte >> 7)) == 0) {
+            std.log.info("fix_int:{}", .{@as(u7, @truncate(byte))});
+        } else if (@as(u1, @truncate(byte >> 6)) == 0) {
+            //
+        } else if (@as(u3, @truncate(byte >> 5)) == 0b111) {
+            std.log.info("fix_n_int:{}", .{@as(i8, @intCast(@as(u5, @truncate(byte)))) * -1});
+
+            //
+        }
+    }
+}
+
 test {
     const test_struct = struct {
         compact: bool,
         schema: u32,
+        list: [4]u8,
     };
-    const ts = test_struct{ .compact = true, .schema = 0 };
+    const ts = test_struct{ .compact = true, .schema = 0, .list = [4]u8{ 1, 2, 3, 4 } };
     var al = std.ArrayList(u8).init(std.testing.allocator);
     defer al.deinit();
 
     try encode(test_struct, ts, al.writer());
 
     std.log.err("{}", .{std.fmt.fmtSliceEscapeUpper(al.items)});
+
+    //var fbs
+
 }
