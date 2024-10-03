@@ -205,29 +205,154 @@ pub fn encode(comptime T: type, val: T, writer: anytype) !void {
     //
 }
 
-pub fn decode(reader: anytype) !void {
-    while (true) {
-        const byte = reader.readByte() catch |err| {
-            std.log.err("err:{}", .{err});
-            break;
-        };
-        if (@as(u1, @truncate(byte >> 7)) == 0) {
-            std.log.err("fix_int:{}", .{@as(u7, @truncate(byte))});
-        } else if (@as(u4, @truncate(byte >> 4)) == 0b1000) {
-            const len: u4 = @truncate(byte);
-            std.log.err("fix_map:{}", .{len});
-            //
-            decodeMap(len, reader);
-        } else if (@as(u3, @truncate(byte >> 5)) == 0b111) {
-            std.log.err("fix_n_int:{}", .{@as(i8, @intCast(@as(u5, @truncate(byte)))) * -1});
+const DecodeMapError = error{
+    ReadFail,
+    TypeFail,
+    SizeFail,
+};
 
-            //
-        }
+pub fn decode(comptime T: type, reader: anytype) DecodeMapError!T {
+    const tInfo = @typeInfo(T);
+    switch (tInfo) {
+        .@"struct" => |s| {
+            _ = s;
+            return try decodeMap(T, reader);
+        },
+        .bool => {
+            const byte = reader.readByte() catch return error.ReadFail;
+            switch (byte) {
+                0xc3 => return true,
+                0xc2 => return false,
+                else => return error.TypeFail,
+            }
+        },
+        .int => {
+            return decodeInt(T, reader);
+        },
+        else => {
+            unreachable;
+        },
     }
 }
 
-fn decodeMap(len: usize, reader: anytype) !void {
-    for (0..len) |idx| {}
+pub fn decodeInt(comptime T: type, reader: anytype) DecodeMapError!T {
+    const typeInfo = @typeInfo(T).int;
+    const signedness = typeInfo.signedness;
+    const byte = reader.readByte() catch return error.ReadFail;
+    if ((byte & 0b10000000) == 0) {
+        return @intCast(0x7F & byte);
+    } else if (@as(u3, @truncate(byte >> 5)) == 0b111) {
+        switch (signedness) {
+            .unsigned => return error.TypeFail,
+            .signed => {
+                const val: T = @intCast(@as(u5, @truncate(byte)));
+                return val * -1;
+            },
+        }
+    }
+    switch (signedness) {
+        .unsigned => {
+            switch (byte) {
+                0xcc => {
+                    return reader.readInt(u8, .big) catch return error.ReadFail;
+                },
+                0xcd => {
+                    if (typeInfo.bits >= 16) {
+                        return reader.readInt(u16, .big) catch return error.ReadFail;
+                    } else {
+                        return error.TypeFail;
+                    }
+                },
+                0xce => {
+                    if (typeInfo.bits >= 32) {
+                        return reader.readInt(u32, .big) catch return error.ReadFail;
+                    } else {
+                        return error.TypeFail;
+                    }
+                },
+                0xcf => {
+                    if (typeInfo.bits >= 64) {
+                        return reader.readInt(u64, .big) catch return error.ReadFail;
+                    } else {
+                        return error.TypeFail;
+                    }
+                },
+                else => return error.TypeFail,
+            }
+        },
+        .signed => {
+            switch (byte) {
+                0xd0 => return reader.readInt(i8, .big) catch return error.ReadFail,
+                0xd1 => {
+                    if (typeInfo.bits >= 16) {
+                        return reader.readInt(i16, .big) catch return error.ReadFail;
+                    } else {
+                        return error.TypeFail;
+                    }
+                },
+                0xd2 => {
+                    if (typeInfo.bits >= 32) {
+                        return reader.readInt(i32, .big) catch return error.ReadFail;
+                    } else {
+                        return error.TypeFail;
+                    }
+                },
+                0xd3 => {
+                    if (typeInfo.bits >= 64) {
+                        return reader.readInt(i64, .big) catch return error.ReadFail;
+                    } else {
+                        return error.TypeFail;
+                    }
+                },
+                else => return error.TypeFail,
+            }
+        },
+    }
+}
+
+fn expectIdentifier(reader: anytype, buffer: []u8) DecodeMapError![]const u8 {
+    const byte = reader.readByte() catch return error.ReadFail;
+
+    const len: u32 = if (@as(u3, @truncate(byte >> 5)) == 0b101)
+        @as(u5, @truncate(byte))
+    else if (byte == 0xd9)
+        reader.readInt(u8, .big) catch return error.ReadFail //
+    else if (byte == 0xda)
+        reader.readInt(u16, .big) catch return error.ReadFail //
+    else if (byte == 0xdb)
+        reader.readInt(u32, .big) catch return error.ReadFail //
+    else
+        return error.TypeFail;
+    if (len > buffer.len) return error.SizeFail;
+    _ = try reader.read(buffer[0..len]);
+    return buffer[0..len];
+}
+
+fn mapLen(reader: anytype) DecodeMapError!u32 {
+    const byte = reader.readByte() catch return error.ReadFail;
+    if (@as(u4, @truncate(byte >> 4)) == 0b1000) return @as(u4, @truncate(byte));
+    if (byte == 0xde) return reader.readInt(u16, .big) catch return error.ReadFail;
+    if (byte == 0xdf) return reader.readInt(u32, .big) catch return error.ReadFail;
+    return error.TypeFail;
+}
+
+fn decodeMap(comptime T: type, reader: anytype) DecodeMapError!T {
+    const tInfo = @typeInfo(T).@"struct";
+    var ret: T = undefined;
+    const len = try mapLen(reader);
+    var nameBuffer: [512]u8 = undefined;
+    for (0..len) |idx| {
+        _ = idx;
+        const field = try expectIdentifier(reader, nameBuffer[0..]);
+        std.log.err("field:{s}", .{field});
+        inline for (tInfo.fields) |f| {
+            if (std.mem.eql(u8, field, f.name)) {
+                std.log.err("match:{s}", .{f.name});
+                @field(ret, f.name) = try decode(f.type, reader);
+            }
+        }
+    }
+    return ret;
 }
 
 test {
@@ -245,5 +370,6 @@ test {
     std.log.err("{}", .{std.fmt.fmtSliceEscapeUpper(al.items)});
 
     var fbs = std.io.fixedBufferStream(al.items);
-    try decode(fbs.reader());
+    const val = try decode(test_struct, fbs.reader());
+    std.log.err("{}", .{val});
 }
