@@ -207,17 +207,27 @@ pub fn encode(comptime T: type, val: T, writer: anytype) !void {
 
 pub fn decode(reader: anytype) !void {
     while (true) {
-        const byte = reader.readByte() catch break;
+        const byte = reader.readByte() catch |err| {
+            std.log.err("err:{}", .{err});
+            break;
+        };
         if (@as(u1, @truncate(byte >> 7)) == 0) {
-            std.log.info("fix_int:{}", .{@as(u7, @truncate(byte))});
-        } else if (@as(u1, @truncate(byte >> 6)) == 0) {
+            std.log.err("fix_int:{}", .{@as(u7, @truncate(byte))});
+        } else if (@as(u4, @truncate(byte >> 4)) == 0b1000) {
+            const len: u4 = @truncate(byte);
+            std.log.err("fix_map:{}", .{len});
             //
+            decodeMap(len, reader);
         } else if (@as(u3, @truncate(byte >> 5)) == 0b111) {
-            std.log.info("fix_n_int:{}", .{@as(i8, @intCast(@as(u5, @truncate(byte)))) * -1});
+            std.log.err("fix_n_int:{}", .{@as(i8, @intCast(@as(u5, @truncate(byte)))) * -1});
 
             //
         }
     }
+}
+
+fn decodeMap(len: usize, reader: anytype) !void {
+    for (0..len) |idx| {}
 }
 
 test {
@@ -234,6 +244,6 @@ test {
 
     std.log.err("{}", .{std.fmt.fmtSliceEscapeUpper(al.items)});
 
-    //var fbs
-
+    var fbs = std.io.fixedBufferStream(al.items);
+    try decode(fbs.reader());
 }
