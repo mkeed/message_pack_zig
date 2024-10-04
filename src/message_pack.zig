@@ -229,8 +229,44 @@ pub fn decode(comptime T: type, reader: anytype) DecodeMapError!T {
         .int => {
             return decodeInt(T, reader);
         },
+        .array => |al| {
+            if (al.child == u8) {
+                const len = try expectArrayLength(reader);
+            } else {
+                var result = std.mem.zeroes(T);
+                const len = try expectArrayLength(reader);
+                const is_optional = @typeInfo(al.child) == .optional;
+                if (!is_optional) {
+                    if (len != al.len) return error.TypeFail;
+                }
+                if (len > al.len) return error.TypeFail;
+                const iter_len = @min(al.len, len);
+                for (0..iter_len) |idx| {
+                    result[idx] = try decode(al.child, reader);
+                }
+                return result;
+            }
+        },
         else => {
-            unreachable;
+            @compileLog("Unimplemented type", T);
+            comptime unreachable;
+        },
+    }
+}
+
+pub fn expectArrayLength(reader: anytype) DecodeMapError!u32 {
+    const byte = reader.readByte() catch return error.ReadFail;
+    if (@as(u4, @truncate(byte >> 4)) == 0b1001) return @as(u4, @truncate(byte));
+    switch (byte) {
+        0xdc => {
+            return reader.readInt(u16, .big) catch return error.ReadFail;
+        },
+        0xdd => {
+            return reader.readInt(u32, .big) catch return error.ReadFail;
+        },
+        else => {
+            std.log.err("got:{x}", .{byte});
+            return error.TypeFail;
         },
     }
 }
@@ -361,7 +397,7 @@ test {
         schema: u32,
         list: [4]u8,
     };
-    const ts = test_struct{ .compact = true, .schema = 0, .list = [4]u8{ 1, 2, 3, 4 } };
+    const ts = test_struct{ .compact = true, .schema = 43, .list = [4]u8{ 1, 2, 3, 4 } };
     var al = std.ArrayList(u8).init(std.testing.allocator);
     defer al.deinit();
 
@@ -371,5 +407,5 @@ test {
 
     var fbs = std.io.fixedBufferStream(al.items);
     const val = try decode(test_struct, fbs.reader());
-    std.log.err("{}", .{val});
+    std.log.err("{} => {}", .{ val, ts });
 }
