@@ -147,11 +147,11 @@ pub fn encode(comptime T: type, val: T, writer: anytype) !void {
                 }
             }
         },
-        .@"enum" => {
-            try writeString(@tagName(val), writer);
+        .@"enum" => |e| {
+            try encode(e.tag_type, @intFromEnum(val), writer);
         },
         .enum_literal => {
-            try writeString(@tagName(val), writer);
+            unreachable; //TODO
         },
         .@"union" => {
             unreachable; //TODO
@@ -171,11 +171,13 @@ pub fn encode(comptime T: type, val: T, writer: anytype) !void {
         .float => |f| {
             if (f.bits == 32) {
                 try writer.writeInt(u8, 0xca, .big);
-                try writer.writeFloat(f32, val);
-            } else {
+            } else if (f.bits == 64) {
                 try writer.writeInt(u8, 0xcb, .big);
-                try writer.writeFloat(f64, val);
+            } else {
+                unreachable;
             }
+            const bytes = std.mem.toBytes(val);
+            _ = try writer.write(bytes[0..]);
         },
         .array => |a_info| {
             if (a_info.child == u8) {
@@ -230,12 +232,19 @@ pub fn decode(comptime T: type, reader: anytype) DecodeMapError!T {
             return decodeInt(T, reader);
         },
         .array => |al| {
+            const is_optional = @typeInfo(al.child) == .optional;
+            var result = std.mem.zeroes(T);
             if (al.child == u8) {
-                const len = try expectArrayLength(reader);
+                const len = try expectBinLength(reader);
+
+                if (!is_optional) {
+                    if (len != al.len) return error.TypeFail;
+                }
+                if (len > al.len) return error.TypeFail;
+                _ = try reader.read(result[0..]);
             } else {
-                var result = std.mem.zeroes(T);
                 const len = try expectArrayLength(reader);
-                const is_optional = @typeInfo(al.child) == .optional;
+
                 if (!is_optional) {
                     if (len != al.len) return error.TypeFail;
                 }
@@ -244,17 +253,73 @@ pub fn decode(comptime T: type, reader: anytype) DecodeMapError!T {
                 for (0..iter_len) |idx| {
                     result[idx] = try decode(al.child, reader);
                 }
-                return result;
+            }
+            return result;
+        },
+        .float => |f| {
+            const size = try expectFloatLen(reader);
+            switch (size) {
+                .f32 => {
+                    var buf = std.mem.zeroes([4]u8);
+                    _ = reader.read(buf[0..]) catch return error.ReadFail;
+                    return std.mem.bytesToValue(f32, buf[0..]);
+                },
+                .f64 => {
+                    if (f.bits == 32) {
+                        return error.TypeFail;
+                    } else {
+                        var buf = std.mem.zeroes([8]u8);
+                        _ = reader.read(buf[0..]) catch return error.ReadFail;
+                        return std.mem.bytesToValue(f64, buf[0..]);
+                    }
+                },
             }
         },
-        else => {
+        .pointer => {},
+        .optional => {},
+        .@"enum" => |e| {
+            const val = try decodeInt(e.tag_type, reader);
+            return std.meta.intToEnum(T, val) catch return error.TypeFail;
+        },
+        .enum_literal => {
+            var buf: [maxEnumLen]u8 = undefined;
+            const name = try expectIdentifier(reader, buf[0..]);
+            if (std.meta.stringToEnum(T, name)) |value| {
+                value;
+            } else {
+                return error.TypeFail;
+            }
+        },
+        .@"union" => {},
+        .vector => {},
+        .type, .void, .noreturn, .comptime_float, .comptime_int, .undefined, .error_union, .error_set, .@"fn", .@"opaque", .frame, .@"anyframe", .null => {
             @compileLog("Unimplemented type", T);
             comptime unreachable;
         },
     }
 }
 
-pub fn expectArrayLength(reader: anytype) DecodeMapError!u32 {
+fn maxEnumLen(comptime info: std.inbuilt.Enum) comptime_int {
+    var len: comptime_int = 0;
+    for (info.fields) |f| {
+        if (f.name.len > len) len = f.name.len;
+    }
+    return len;
+}
+
+fn expectFloatLen(reader: anytype) DecodeMapError!enum { f32, f64 } {
+    const byte = reader.readByte() catch return error.ReadFail;
+    switch (byte) {
+        0xca => return .f32,
+        0xcb => return .f64,
+        else => {
+            std.log.err("got:{x}", .{byte});
+            return error.TypeFail;
+        },
+    }
+}
+
+fn expectArrayLength(reader: anytype) DecodeMapError!u32 {
     const byte = reader.readByte() catch return error.ReadFail;
     if (@as(u4, @truncate(byte >> 4)) == 0b1001) return @as(u4, @truncate(byte));
     switch (byte) {
@@ -262,6 +327,25 @@ pub fn expectArrayLength(reader: anytype) DecodeMapError!u32 {
             return reader.readInt(u16, .big) catch return error.ReadFail;
         },
         0xdd => {
+            return reader.readInt(u32, .big) catch return error.ReadFail;
+        },
+        else => {
+            std.log.err("got:{x}", .{byte});
+            return error.TypeFail;
+        },
+    }
+}
+
+fn expectBinLength(reader: anytype) DecodeMapError!u32 {
+    const byte = reader.readByte() catch return error.ReadFail;
+    switch (byte) {
+        0xc4 => {
+            return reader.readInt(u8, .big) catch return error.ReadFail;
+        },
+        0xc5 => {
+            return reader.readInt(u16, .big) catch return error.ReadFail;
+        },
+        0xc6 => {
             return reader.readInt(u32, .big) catch return error.ReadFail;
         },
         else => {
@@ -380,10 +464,8 @@ fn decodeMap(comptime T: type, reader: anytype) DecodeMapError!T {
     for (0..len) |idx| {
         _ = idx;
         const field = try expectIdentifier(reader, nameBuffer[0..]);
-        std.log.err("field:{s}", .{field});
         inline for (tInfo.fields) |f| {
             if (std.mem.eql(u8, field, f.name)) {
-                std.log.err("match:{s}", .{f.name});
                 @field(ret, f.name) = try decode(f.type, reader);
             }
         }
@@ -396,14 +478,22 @@ test {
         compact: bool,
         schema: u32,
         list: [4]u8,
+        fl: f64,
+        e: enum(u8) { one, two, three, four },
     };
-    const ts = test_struct{ .compact = true, .schema = 43, .list = [4]u8{ 1, 2, 3, 4 } };
+    const ts = test_struct{
+        .compact = true,
+        .schema = 43,
+        .list = [4]u8{ 1, 2, 3, 4 },
+        .fl = 0.123,
+        .e = .three,
+    };
     var al = std.ArrayList(u8).init(std.testing.allocator);
     defer al.deinit();
 
     try encode(test_struct, ts, al.writer());
 
-    std.log.err("{}", .{std.fmt.fmtSliceEscapeUpper(al.items)});
+    std.log.err("{}", .{std.fmt.fmtSliceHexUpper(al.items)});
 
     var fbs = std.io.fixedBufferStream(al.items);
     const val = try decode(test_struct, fbs.reader());
