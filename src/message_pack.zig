@@ -1,27 +1,4 @@
 const std = @import("std");
-pub const Value = union(enum) {
-    fixmap: u8,
-    fixarray: u8,
-    fixstr: u8,
-    nil: void,
-    bool: bool,
-    bin: []const u8,
-    ext: []const u8,
-    float64: f64,
-    float32: f32,
-    int: union(enum) {
-        int8: i8,
-        int16: i16,
-        int32: i32,
-        int64: i64,
-    },
-    u_int: union(enum) {
-        int8: u8,
-        int16: u16,
-        int32: u32,
-        int64: u64,
-    },
-};
 
 fn writeString(data: []const u8, writer: anytype) !void {
     if (data.len < 31) {
@@ -197,7 +174,7 @@ pub fn encode(comptime T: type, val: T, writer: anytype) !void {
             try writer.writeInt(u8, 0xc0);
         },
         .optional => {
-            if (val) |v| try encode(@TypeOf(v), v, writer) else try writer.writeInt(u8, 0xC0);
+            if (val) |v| try encode(@TypeOf(v), v, writer) else try writer.writeInt(u8, 0xC0, .big);
         },
 
         .type, .void, .noreturn, .@"fn", .frame, .@"anyframe", .@"opaque", .error_union, .error_set, .undefined => unreachable,
@@ -211,83 +188,41 @@ const DecodeMapError = error{
     ReadFail,
     TypeFail,
     SizeFail,
+    TokenError,
+    InvalidTokenType,
+    IntegerError,
+    FailOver, //TODO remove
 };
 
-pub fn decode(comptime T: type, reader: anytype) DecodeMapError!T {
+pub fn decode(comptime T: type, tokens: *MessagePackIter) DecodeMapError!T {
     const tInfo = @typeInfo(T);
     switch (tInfo) {
-        .@"struct" => |s| {
-            _ = s;
-            return try decodeMap(T, reader);
-        },
+        //.@"struct" => |s| {},
         .bool => {
-            const byte = reader.readByte() catch return error.ReadFail;
-            switch (byte) {
-                0xc3 => return true,
-                0xc2 => return false,
-                else => return error.TypeFail,
+            if (tokens.next() catch return error.TokenError) |val| {
+                switch (val) {
+                    .bool => |b| return b,
+                    else => return error.InvalidTokenType,
+                }
+                return error.MissingToken;
             }
         },
-        .int => {
-            return decodeInt(T, reader);
-        },
-        .array => |al| {
-            const is_optional = @typeInfo(al.child) == .optional;
-            var result = std.mem.zeroes(T);
-            if (al.child == u8) {
-                const len = try expectBinLength(reader);
+        .int => |i| {
+            if (tokens.next() catch return error.TokenError) |val| {
+                switch (i.signedness) {
+                    .unsigned => {
+                        const max: u64 = std.math.maxInt(T);
+                        const value: u64 = switch (val) {
+                            .int => |i_v| if (i_v > 0 and i_v < max) @intCast(i_v) else return error.IntegerError,
+                            .u_int => |u_v| if (u_v < max) u_v else return error.IntegerError,
+                            else => return error.InvalidTokenType,
+                        };
+                        return @intCast(value);
+                    },
+                    .signed => {},
+                }
 
-                if (!is_optional) {
-                    if (len != al.len) return error.TypeFail;
-                }
-                if (len > al.len) return error.TypeFail;
-                _ = try reader.read(result[0..]);
-            } else {
-                const len = try expectArrayLength(reader);
-
-                if (!is_optional) {
-                    if (len != al.len) return error.TypeFail;
-                }
-                if (len > al.len) return error.TypeFail;
-                const iter_len = @min(al.len, len);
-                for (0..iter_len) |idx| {
-                    result[idx] = try decode(al.child, reader);
-                }
-            }
-            return result;
-        },
-        .float => |f| {
-            const size = try expectFloatLen(reader);
-            switch (size) {
-                .f32 => {
-                    var buf = std.mem.zeroes([4]u8);
-                    _ = reader.read(buf[0..]) catch return error.ReadFail;
-                    return std.mem.bytesToValue(f32, buf[0..]);
-                },
-                .f64 => {
-                    if (f.bits == 32) {
-                        return error.TypeFail;
-                    } else {
-                        var buf = std.mem.zeroes([8]u8);
-                        _ = reader.read(buf[0..]) catch return error.ReadFail;
-                        return std.mem.bytesToValue(f64, buf[0..]);
-                    }
-                },
-            }
-        },
-        .pointer => {},
-        .optional => {},
-        .@"enum" => |e| {
-            const val = try decodeInt(e.tag_type, reader);
-            return std.meta.intToEnum(T, val) catch return error.TypeFail;
-        },
-        .enum_literal => {
-            var buf: [maxEnumLen]u8 = undefined;
-            const name = try expectIdentifier(reader, buf[0..]);
-            if (std.meta.stringToEnum(T, name)) |value| {
-                value;
-            } else {
-                return error.TypeFail;
+                return error.MissingToken;
             }
         },
         .@"union" => {},
@@ -296,206 +231,214 @@ pub fn decode(comptime T: type, reader: anytype) DecodeMapError!T {
             @compileLog("Unimplemented type", T);
             comptime unreachable;
         },
+        else => return error.TODO,
     }
-}
-
-fn maxEnumLen(comptime info: std.inbuilt.Enum) comptime_int {
-    var len: comptime_int = 0;
-    for (info.fields) |f| {
-        if (f.name.len > len) len = f.name.len;
-    }
-    return len;
-}
-
-fn expectFloatLen(reader: anytype) DecodeMapError!enum { f32, f64 } {
-    const byte = reader.readByte() catch return error.ReadFail;
-    switch (byte) {
-        0xca => return .f32,
-        0xcb => return .f64,
-        else => {
-            std.log.err("got:{x}", .{byte});
-            return error.TypeFail;
-        },
-    }
-}
-
-fn expectArrayLength(reader: anytype) DecodeMapError!u32 {
-    const byte = reader.readByte() catch return error.ReadFail;
-    if (@as(u4, @truncate(byte >> 4)) == 0b1001) return @as(u4, @truncate(byte));
-    switch (byte) {
-        0xdc => {
-            return reader.readInt(u16, .big) catch return error.ReadFail;
-        },
-        0xdd => {
-            return reader.readInt(u32, .big) catch return error.ReadFail;
-        },
-        else => {
-            std.log.err("got:{x}", .{byte});
-            return error.TypeFail;
-        },
-    }
-}
-
-fn expectBinLength(reader: anytype) DecodeMapError!u32 {
-    const byte = reader.readByte() catch return error.ReadFail;
-    switch (byte) {
-        0xc4 => {
-            return reader.readInt(u8, .big) catch return error.ReadFail;
-        },
-        0xc5 => {
-            return reader.readInt(u16, .big) catch return error.ReadFail;
-        },
-        0xc6 => {
-            return reader.readInt(u32, .big) catch return error.ReadFail;
-        },
-        else => {
-            std.log.err("got:{x}", .{byte});
-            return error.TypeFail;
-        },
-    }
-}
-
-pub fn decodeInt(comptime T: type, reader: anytype) DecodeMapError!T {
-    const typeInfo = @typeInfo(T).int;
-    const signedness = typeInfo.signedness;
-    const byte = reader.readByte() catch return error.ReadFail;
-    if ((byte & 0b10000000) == 0) {
-        return @intCast(0x7F & byte);
-    } else if (@as(u3, @truncate(byte >> 5)) == 0b111) {
-        switch (signedness) {
-            .unsigned => return error.TypeFail,
-            .signed => {
-                const val: T = @intCast(@as(u5, @truncate(byte)));
-                return val * -1;
-            },
-        }
-    }
-    switch (signedness) {
-        .unsigned => {
-            switch (byte) {
-                0xcc => {
-                    return reader.readInt(u8, .big) catch return error.ReadFail;
-                },
-                0xcd => {
-                    if (typeInfo.bits >= 16) {
-                        return reader.readInt(u16, .big) catch return error.ReadFail;
-                    } else {
-                        return error.TypeFail;
-                    }
-                },
-                0xce => {
-                    if (typeInfo.bits >= 32) {
-                        return reader.readInt(u32, .big) catch return error.ReadFail;
-                    } else {
-                        return error.TypeFail;
-                    }
-                },
-                0xcf => {
-                    if (typeInfo.bits >= 64) {
-                        return reader.readInt(u64, .big) catch return error.ReadFail;
-                    } else {
-                        return error.TypeFail;
-                    }
-                },
-                else => return error.TypeFail,
-            }
-        },
-        .signed => {
-            switch (byte) {
-                0xd0 => return reader.readInt(i8, .big) catch return error.ReadFail,
-                0xd1 => {
-                    if (typeInfo.bits >= 16) {
-                        return reader.readInt(i16, .big) catch return error.ReadFail;
-                    } else {
-                        return error.TypeFail;
-                    }
-                },
-                0xd2 => {
-                    if (typeInfo.bits >= 32) {
-                        return reader.readInt(i32, .big) catch return error.ReadFail;
-                    } else {
-                        return error.TypeFail;
-                    }
-                },
-                0xd3 => {
-                    if (typeInfo.bits >= 64) {
-                        return reader.readInt(i64, .big) catch return error.ReadFail;
-                    } else {
-                        return error.TypeFail;
-                    }
-                },
-                else => return error.TypeFail,
-            }
-        },
-    }
-}
-
-fn expectIdentifier(reader: anytype, buffer: []u8) DecodeMapError![]const u8 {
-    const byte = reader.readByte() catch return error.ReadFail;
-
-    const len: u32 = if (@as(u3, @truncate(byte >> 5)) == 0b101)
-        @as(u5, @truncate(byte))
-    else if (byte == 0xd9)
-        reader.readInt(u8, .big) catch return error.ReadFail //
-    else if (byte == 0xda)
-        reader.readInt(u16, .big) catch return error.ReadFail //
-    else if (byte == 0xdb)
-        reader.readInt(u32, .big) catch return error.ReadFail //
-    else
-        return error.TypeFail;
-    if (len > buffer.len) return error.SizeFail;
-    _ = try reader.read(buffer[0..len]);
-    return buffer[0..len];
-}
-
-fn mapLen(reader: anytype) DecodeMapError!u32 {
-    const byte = reader.readByte() catch return error.ReadFail;
-    if (@as(u4, @truncate(byte >> 4)) == 0b1000) return @as(u4, @truncate(byte));
-    if (byte == 0xde) return reader.readInt(u16, .big) catch return error.ReadFail;
-    if (byte == 0xdf) return reader.readInt(u32, .big) catch return error.ReadFail;
-    return error.TypeFail;
-}
-
-fn decodeMap(comptime T: type, reader: anytype) DecodeMapError!T {
-    const tInfo = @typeInfo(T).@"struct";
-    var ret: T = undefined;
-    const len = try mapLen(reader);
-    var nameBuffer: [512]u8 = undefined;
-    for (0..len) |idx| {
-        _ = idx;
-        const field = try expectIdentifier(reader, nameBuffer[0..]);
-        inline for (tInfo.fields) |f| {
-            if (std.mem.eql(u8, field, f.name)) {
-                @field(ret, f.name) = try decode(f.type, reader);
-            }
-        }
-    }
-    return ret;
+    return error.FailOver;
 }
 
 test {
-    const test_struct = struct {
-        compact: bool,
-        schema: u32,
-        list: [4]u8,
-        fl: f64,
-        e: enum(u8) { one, two, three, four },
+    {
+        const data = "\x44";
+        errdefer std.log.err("{}", .{std.fmt.fmtSliceEscapeUpper(data)});
+        var iter = MessagePackIter{ .data = data };
+        const value = try decode(u32, &iter);
+        try std.testing.expectEqual(@as(u32, 0x44), value);
+    }
+    {
+        const data = "\xc2";
+        errdefer std.log.err("{}", .{std.fmt.fmtSliceEscapeUpper(data)});
+        var iter = MessagePackIter{ .data = data };
+        const value = try decode(bool, &iter);
+        try std.testing.expectEqual(@as(bool, false), value);
+    }
+}
+
+const MessagePackIter = struct {
+    data: []const u8,
+    idx: usize = 0,
+    pub const Token = union(enum) {
+        map: u32,
+        array: u32,
+        bin: []const u8,
+        int: i64,
+        u_int: u64,
+        bool: bool,
+        nil: void,
+        str: []const u8,
+        ext: struct { type: u8, data: []const u8 },
+        f32: f32,
+        f64: f64,
     };
-    const ts = test_struct{
-        .compact = true,
-        .schema = 43,
-        .list = [4]u8{ 1, 2, 3, 4 },
-        .fl = 0.123,
-        .e = .three,
+    fn nextByte(self: *MessagePackIter) ?u8 {
+        if (self.idx >= self.data.len) return null;
+        defer self.idx += 1;
+        return self.data[self.idx];
+    }
+    fn getSlice(self: *MessagePackIter, len: usize) ![]const u8 {
+        if (self.idx + len >= self.data.len) return error.TooLong;
+        defer self.idx += len;
+        return self.data[self.idx..][0..len];
+    }
+    fn readInt(self: *MessagePackIter, comptime T: type) !T {
+        return std.mem.readVarInt(T, try self.getSlice(@sizeOf(T)), .big);
+    }
+    fn readIntToken(self: *MessagePackIter, comptime T: type) !Token {
+        const int_info = @typeInfo(T).int;
+        switch (int_info.signedness) {
+            .unsigned => return .{ .u_int = std.mem.readVarInt(T, try self.getSlice(@sizeOf(T)), .big) },
+            .signed => return .{ .int = std.mem.readVarInt(T, try self.getSlice(@sizeOf(T)), .big) },
+        }
+    }
+    fn readFloat(self: *MessagePackIter, comptime T: type) !T {
+        const data = try self.getSlice(@sizeOf(T));
+        var d: T = 0;
+        var ptr: [*]u8 = @ptrCast(&d);
+        for (data, 0..) |b, idx| ptr[idx] = b;
+        switch (@import("builtin").cpu.arch.endian()) {
+            .little => {
+                for (data, 0..) |b, idx| ptr[@sizeOf(T) - idx - 1] = b;
+            },
+            .big => {
+                for (data, 0..) |b, idx| ptr[idx] = b;
+            },
+        }
+        return d;
+    }
+    pub fn next(self: *MessagePackIter) !?Token {
+        const byte = self.nextByte() orelse return null;
+        switch (byte) {
+            0x00...0x7f => return .{ .u_int = byte }, //positive fixint
+
+            0x80...0x8f => return .{ .map = @as(u4, @truncate(byte)) }, //fixmap
+            0x90...0x9f => return .{ .array = @as(u4, @truncate(byte)) }, //fixarray
+            0xa0...0xbf => return .{ .str = try self.getSlice(@as(u5, @truncate(byte))) }, //fixstr
+            0xc0 => return .nil,
+            0xc1 => return error.UnustedToken,
+            0xc2 => return .{ .bool = false },
+            0xc3 => return .{ .bool = true },
+            0xc4 => return .{ .bin = try self.getSlice(try self.readInt(u8)) },
+            0xc5 => return .{ .bin = try self.getSlice(try self.readInt(u16)) },
+            0xc6 => return .{ .bin = try self.getSlice(try self.readInt(u32)) },
+            0xc7 => {
+                const len = try self.readInt(u8);
+                return .{
+                    .ext = .{
+                        .type = self.nextByte() orelse return error.TooLong,
+                        .data = try self.getSlice(len),
+                    },
+                };
+            },
+            0xc8 => {
+                const len = try self.readInt(u16);
+                return .{
+                    .ext = .{
+                        .type = self.nextByte() orelse return error.TooLong,
+                        .data = try self.getSlice(len),
+                    },
+                };
+            },
+            0xc9 => {
+                const len = try self.readInt(u32);
+                return .{
+                    .ext = .{
+                        .type = self.nextByte() orelse return error.TooLong,
+                        .data = try self.getSlice(len),
+                    },
+                };
+            },
+            0xca => {
+                return .{ .f32 = try self.readFloat(f32) };
+            }, //f32
+            0xcb => {
+                return .{ .f64 = try self.readFloat(f64) };
+            }, //f64
+            0xcc => return try self.readIntToken(u8),
+            0xcd => return try self.readIntToken(u16),
+            0xce => return try self.readIntToken(u32),
+            0xcf => return try self.readIntToken(u64),
+            0xd0 => return try self.readIntToken(i8),
+            0xd1 => return try self.readIntToken(i16),
+            0xd2 => return try self.readIntToken(i32),
+            0xd3 => return try self.readIntToken(i64),
+            0xd4 => {
+                return .{
+                    .ext = .{
+                        .type = self.nextByte() orelse return error.TooLong,
+                        .data = try self.getSlice(1),
+                    },
+                };
+            }, //fixext1
+            0xd5 => {
+                return .{
+                    .ext = .{
+                        .type = self.nextByte() orelse return error.TooLong,
+                        .data = try self.getSlice(2),
+                    },
+                };
+            }, //fixext2
+            0xd6 => {
+                return .{
+                    .ext = .{
+                        .type = self.nextByte() orelse return error.TooLong,
+                        .data = try self.getSlice(4),
+                    },
+                };
+            }, //fixext4
+            0xd7 => {
+                return .{
+                    .ext = .{
+                        .type = self.nextByte() orelse return error.TooLong,
+                        .data = try self.getSlice(8),
+                    },
+                };
+            }, //fixext8
+            0xd8 => {
+                return .{
+                    .ext = .{
+                        .type = self.nextByte() orelse return error.TooLong,
+                        .data = try self.getSlice(16),
+                    },
+                };
+            }, //fixext16
+            0xd9 => return .{ .str = try self.getSlice(try self.readInt(u8)) },
+            0xda => return .{ .str = try self.getSlice(try self.readInt(u16)) },
+            0xdb => return .{ .str = try self.getSlice(try self.readInt(u32)) },
+            0xdc => return .{ .array = try self.readInt(u16) },
+            0xdd => return .{ .array = try self.readInt(u32) },
+            0xde => return .{ .map = try self.readInt(u16) },
+            0xdf => return .{ .map = try self.readInt(u32) },
+            0xe0...0xff => {
+                const val: u5 = @truncate(byte);
+                return .{ .int = 0 - val };
+            },
+        }
+    }
+};
+
+test {
+    const tc = struct {
+        encoded: []const u8,
+        tokens: []const MessagePackIter.Token,
     };
-    var al = std.ArrayList(u8).init(std.testing.allocator);
-    defer al.deinit();
-
-    try encode(test_struct, ts, al.writer());
-
-    std.log.err("{}", .{std.fmt.fmtSliceHexUpper(al.items)});
-
-    var fbs = std.io.fixedBufferStream(al.items);
-    const val = try decode(test_struct, fbs.reader());
-    std.log.err("{} => {}", .{ val, ts });
+    const tests = [_]tc{
+        .{
+            .encoded = "\x82\xA7compact\xc3\xa6schema\x00",
+            .tokens = &.{
+                .{ .map = 2 },
+                .{ .str = "compact" },
+                .{ .bool = true },
+                .{ .str = "schema" },
+                .{ .u_int = 0 },
+            },
+        },
+    };
+    for (tests) |t| {
+        var iter = MessagePackIter{ .data = t.encoded };
+        var idx: usize = 0;
+        while (try iter.next()) |n| {
+            errdefer std.log.err("{}", .{n});
+            defer idx += 1;
+            try std.testing.expectEqualDeep(t.tokens[idx], n);
+        }
+    }
 }
