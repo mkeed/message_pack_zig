@@ -192,9 +192,14 @@ const DecodeMapError = error{
     InvalidTokenType,
     IntegerError,
     FailOver, //TODO remove
+    MissingToken,
+    DoubleSetField,
 };
 
-pub fn decode(comptime T: type, tokens: *MessagePackIter) DecodeMapError!T {
+pub fn decode(
+    comptime T: type,
+    tokens: *MessagePackIter,
+) DecodeMapError!T {
     const tInfo = @typeInfo(T);
     switch (tInfo) {
         //.@"struct" => |s| {},
@@ -231,6 +236,47 @@ pub fn decode(comptime T: type, tokens: *MessagePackIter) DecodeMapError!T {
             @compileLog("Unimplemented type", T);
             comptime unreachable;
         },
+        .@"struct" => |s| {
+            const items = blk: {
+                if (tokens.next() catch return error.TokenError) |val| {
+                    switch (val) {
+                        .map => |m| break :blk m,
+                        else => return error.InvalidTokenType,
+                    }
+                }
+                return error.MissingToken;
+            };
+            var result: T = undefined;
+            var set = std.mem.zeroes([s.fields.len]bool);
+            for (0..items) |_| {
+                const str = blk: {
+                    if (tokens.next() catch return error.TokenError) |val| {
+                        switch (val) {
+                            .str => |m| break :blk m,
+                            else => return error.InvalidTokenType,
+                        }
+                    }
+                    return error.MissingToken;
+                };
+                inline for (s.fields, 0..) |f, idx| {
+                    if (std.mem.eql(u8, f.name, str)) {
+                        if (set[idx]) {
+                            return error.DoubleSetField;
+                        }
+                        set[idx] = true;
+                        @field(result, f.name) = try decode(f.type, tokens);
+                        //std.log.err("Set {s} to {}", .{ f.name, @field(result, f.name) });
+                    }
+                }
+                //
+
+            }
+            return result;
+        },
+        .pointer => |p| {
+            _ = p;
+            return error.TODOD2;
+        },
         else => return error.TODO,
     }
     return error.FailOver;
@@ -251,6 +297,14 @@ test {
         const value = try decode(bool, &iter);
         try std.testing.expectEqual(@as(bool, false), value);
     }
+    {
+        const T = struct { compact: bool, schema: u32 };
+        const data = "\x82\xA7compact\xc3\xa6schema\x00";
+        errdefer std.log.err("{}", .{std.fmt.fmtSliceEscapeUpper(data)});
+        var iter = MessagePackIter{ .data = data };
+        const value = try decode(T, &iter);
+        try std.testing.expectEqual(T{ .compact = true, .schema = 0 }, value);
+    }
 }
 
 const MessagePackIter = struct {
@@ -268,6 +322,21 @@ const MessagePackIter = struct {
         ext: struct { type: u8, data: []const u8 },
         f32: f32,
         f64: f64,
+        pub fn format(self: Token, _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
+            switch (self) {
+                .map => |m| try std.fmt.format(writer, "Map[{}]", .{m}),
+                .array => |a| try std.fmt.format(writer, "Array[{}]", .{a}),
+                .bin => |b| try std.fmt.format(writer, "Bin:[{}]", .{std.fmt.fmtSliceHexUpper(b)}),
+                .int => |i| try std.fmt.format(writer, "Int[{}]", .{i}),
+                .u_int => |u| try std.fmt.format(writer, "UInt[{}]", .{u}),
+                .bool => |u| try std.fmt.format(writer, "Bool[{}]", .{u}),
+                .nil => try std.fmt.format(writer, "nil", .{}),
+                .str => |u| try std.fmt.format(writer, "str[{s}]", .{u}),
+                .ext => |u| try std.fmt.format(writer, "ext[{}.{}]", .{ u.type, std.fmt.fmtSliceHexUpper(u.data) }),
+                .f32 => |u| try std.fmt.format(writer, "f32[{}]", .{u}),
+                .f64 => |u| try std.fmt.format(writer, "f64[{}]", .{u}),
+            }
+        }
     };
     fn nextByte(self: *MessagePackIter) ?u8 {
         if (self.idx >= self.data.len) return null;
@@ -305,6 +374,13 @@ const MessagePackIter = struct {
         return d;
     }
     pub fn next(self: *MessagePackIter) !?Token {
+        const val = try self.next_inner();
+        //if (val) |v| {
+        //std.log.err("{}", .{v});
+        //}
+        return val;
+    }
+    fn next_inner(self: *MessagePackIter) !?Token {
         const byte = self.nextByte() orelse return null;
         switch (byte) {
             0x00...0x7f => return .{ .u_int = byte }, //positive fixint
