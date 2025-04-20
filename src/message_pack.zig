@@ -44,6 +44,57 @@ fn writeBin(val: []const u8, writer: anytype) !void {
     }
     _ = try writer.write(val);
 }
+fn writeInt(comptime T: type, val: T, writer: anytype) !void {
+    const i = @typeInfo(T).int;
+    switch (i.signedness) {
+        .signed => {
+            if (val > 0 and val <= 0x7F) {
+                try writer.write(val);
+            } else if (val < 0 and val > -31) {
+                try writer.write(0b11100000 | @abs(val));
+            } else {
+                if (i.bits <= 8) {
+                    try writer.writeInt(u8, 0xd0, .big);
+                    try writer.writeInt(i8, val, .big);
+                } else if (i.bits <= 16) {
+                    try writer.writeInt(u8, 0xd1, .big);
+                    try writer.writeInt(i16, val, .big);
+                } else if (i.bits <= 32) {
+                    try writer.writeInt(u8, 0xd2, .big);
+                    try writer.writeInt(i32, val, .big);
+                } else if (i.bits <= 64) {
+                    try writer.writeInt(u8, 0xd3, .big);
+                    try writer.writeInt(i64, val, .big);
+                } else {
+                    unreachable; // not sure what to do about > 64 bits
+                }
+            }
+        },
+        .unsigned => {
+            if (val <= 0x7F) {
+                try writer.writeInt(u8, @truncate(val), .big);
+            } else {
+                if (i.bits <= 8) {
+                    try writer.writeInt(u8, @truncate(val), .big);
+                } else if (i.bits <= 8) {
+                    try writer.writeInt(u8, 0xcc, .big);
+                    try writer.writeInt(u8, val, .big);
+                } else if (i.bits <= 16) {
+                    try writer.writeInt(u8, 0xcd, .big);
+                    try writer.writeInt(u16, val, .big);
+                } else if (i.bits <= 32) {
+                    try writer.writeInt(u8, 0xce, .big);
+                    try writer.writeInt(u32, val, .big);
+                } else if (i.bits <= 64) {
+                    try writer.writeInt(u8, 0xcf, .big);
+                    try writer.writeInt(u64, val, .big);
+                } else {
+                    unreachable; // not sure what to do about > 64 bits
+                }
+            }
+        },
+    }
+}
 
 pub fn encode(comptime T: type, val: T, writer: anytype) !void {
     const info = @typeInfo(T);
@@ -64,57 +115,7 @@ pub fn encode(comptime T: type, val: T, writer: anytype) !void {
                 try encode(f.type, @field(val, f.name), writer);
             }
         },
-        .int => |i| {
-            switch (i.signedness) {
-                .signed => {
-                    if (val > 0 and val <= 0x7F) {
-                        try writer.write(val);
-                    } else if (val < 0 and val > -31) {
-                        try writer.write(0b11100000 | @abs(val));
-                    } else {
-                        if (i.bits <= 8) {
-                            try writer.writeInt(u8, 0xd0, .big);
-                            try writer.writeInt(i8, val, .big);
-                        } else if (i.bits <= 16) {
-                            try writer.writeInt(u8, 0xd1, .big);
-                            try writer.writeInt(i16, val, .big);
-                        } else if (i.bits <= 32) {
-                            try writer.writeInt(u8, 0xd2, .big);
-                            try writer.writeInt(i32, val, .big);
-                        } else if (i.bits <= 64) {
-                            try writer.writeInt(u8, 0xd3, .big);
-                            try writer.writeInt(i64, val, .big);
-                        } else {
-                            unreachable; // not sure what to do about > 64 bits
-                        }
-                    }
-                },
-                .unsigned => {
-                    if (val <= 0x7F) {
-                        try writer.writeInt(u8, @truncate(val), .big);
-                    } else {
-                        if (i.bits <= 8) {
-                            try writer.writeInt(u8, @truncate(val), .big);
-                        } else if (i.bits <= 8) {
-                            try writer.writeInt(u8, 0xcc, .big);
-                            try writer.writeInt(u8, val, .big);
-                        } else if (i.bits <= 16) {
-                            try writer.writeInt(u8, 0xcd, .big);
-                            try writer.writeInt(u16, val, .big);
-                        } else if (i.bits <= 32) {
-                            try writer.writeInt(u8, 0xce, .big);
-                            try writer.writeInt(u32, val, .big);
-                        } else if (i.bits <= 64) {
-                            try writer.writeInt(u8, 0xcf, .big);
-                            try writer.writeInt(u64, val, .big);
-                        } else {
-                            unreachable; // not sure what to do about > 64 bits
-                        }
-                    }
-                },
-            }
-            //
-        },
+        .int => try writeInt(T, val, writer),
         .comptime_int => {
             const ints = []type{ u8, i8, u16, i16, u32, i32, u64, i64 };
             inline for (ints) |t| {
@@ -282,29 +283,17 @@ pub fn decode(
     return error.FailOver;
 }
 
+fn testMessagePack(comptime T: type, exp_val: T, enc_bin: []const u8) !void {
+    errdefer std.log.err("{}", .{std.fmt.fmtSliceEscapeUpper(enc_bin)});
+    var iter = MessagePackIter{ .data = enc_bin };
+    const value = try decode(T, &iter);
+    try std.testing.expectEqual(exp_val, value);
+}
+
 test {
-    {
-        const data = "\x44";
-        errdefer std.log.err("{}", .{std.fmt.fmtSliceEscapeUpper(data)});
-        var iter = MessagePackIter{ .data = data };
-        const value = try decode(u32, &iter);
-        try std.testing.expectEqual(@as(u32, 0x44), value);
-    }
-    {
-        const data = "\xc2";
-        errdefer std.log.err("{}", .{std.fmt.fmtSliceEscapeUpper(data)});
-        var iter = MessagePackIter{ .data = data };
-        const value = try decode(bool, &iter);
-        try std.testing.expectEqual(@as(bool, false), value);
-    }
-    {
-        const T = struct { compact: bool, schema: u32 };
-        const data = "\x82\xA7compact\xc3\xa6schema\x00";
-        errdefer std.log.err("{}", .{std.fmt.fmtSliceEscapeUpper(data)});
-        var iter = MessagePackIter{ .data = data };
-        const value = try decode(T, &iter);
-        try std.testing.expectEqual(T{ .compact = true, .schema = 0 }, value);
-    }
+    try testMessagePack(u32, 0x44, "\x44");
+    try testMessagePack(bool, false, "\xc2");
+    try testMessagePack(struct { compact: bool, schema: u32 }, .{ .compact = true, .schema = 0 }, "\x82\xA7compact\xc3\xa6schema\x00");
 }
 
 const MessagePackIter = struct {
